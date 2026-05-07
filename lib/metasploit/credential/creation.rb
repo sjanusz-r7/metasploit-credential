@@ -549,8 +549,6 @@ module Metasploit::Credential::Creation
     end
   end
 
-
-
   # This method is responsible for creating a barebones `Mdm::Service` object
   # for use by Credential object creation.
   #
@@ -570,14 +568,26 @@ module Metasploit::Credential::Creation
     service_name     = opts.fetch(:service_name)
     protocol         = opts.fetch(:protocol)
     workspace_id     = opts.fetch(:workspace_id)
+    resource         = opts[:resource] || {}
 
-    host_object    = Mdm::Host.where(address: address, workspace_id: workspace_id).first_or_create
-    service_object = Mdm::Service.where(host_id: host_object.id, port: port, proto: protocol, name: service_name).first_or_initialize
+    mdm_host = Mdm::Host.where(address: address, workspace_id: workspace_id).first_or_create!
+    opts[:mdm_host] = mdm_host
 
-    service_object.state = "open"
-    service_object.save!
+    reporting_http = service_name.match?(/^http$/i)
+    reporting_https = service_name.match?(/^https$/i)
+    reporting_ssl = service_name.match?(/^ssl$/i)
+    reporting_tcp = service_name.match?(/^tcp$/i)
 
-    service_object
+    return create_http_service(opts) if reporting_http
+    return create_https_service(opts) if reporting_https
+    return create_ssl_service(opts) if reporting_ssl
+    return create_tcp_service(opts) if reporting_tcp
+
+    # If we don't have HTTP/HTTPS/SSL/TCP, default to a flat service instead of a hierarchy.
+    # This is the already-existing behavior.
+    # We made the world a better place, but some scenarios such as MySQL -> TCP won't be covered.
+
+    Mdm::Service.where(host_id: mdm_host.id, port: port, proto: protocol, name: service_name).first_or_create!(state: 'open', resource: resource)
   end
 
   # This method checks to see if a {Metasploit::Credential::Login} exists for a given
@@ -627,6 +637,54 @@ module Metasploit::Credential::Creation
 
 
   private
+
+  def create_tcp_service(opts = {})
+    port = opts[:port]
+    name = 'tcp'
+    proto = 'tcp'
+    state = opts[:state] || 'open'
+    resource = opts[:resource] || {}
+    mdm_host = opts[:mdm_host]
+    Mdm::Service.where(name: name, port: port, proto: proto, host_id: mdm_host.id).first_or_create!(state: state, resource: resource)
+  end
+
+  def create_ssl_service(opts = {})
+    return unless (tcp_service = create_tcp_service(opts))
+
+    port = opts[:port]
+    name = 'ssl'
+    proto = 'tcp'
+    state = opts[:state] || 'open'
+    resource = opts[:resource] || {}
+    mdm_host = opts[:mdm_host]
+    Mdm::Service.where(name: name, port: port, proto: proto, host_id: mdm_host.id).first_or_create!(state: state, resource: resource, parents: [tcp_service])
+  end
+
+  def create_https_service(opts = {})
+    return unless (ssl_service = create_ssl_service(opts))
+
+    port = opts[:port]
+    name = 'https'
+    proto = 'tcp'
+    state = opts[:state] || 'open'
+    resource = opts[:resource] || {}
+    mdm_host = opts[:mdm_host]
+    Mdm::Service.where(name: name, port: port, proto: proto, host_id: mdm_host.id).first_or_create!(state: state, resource: resource, parents: [ssl_service])
+  end
+
+  def create_http_service(opts = {})
+    # HTTP doesn't sit on top of SSL, only on top of TCP.
+    return unless (tcp_service = create_tcp_service(opts))
+
+    port = opts[:port]
+    name = 'http'
+    proto = 'tcp'
+    state = opts[:state] || 'open'
+    resource = opts[:resource] || {}
+    mdm_host = opts[:mdm_host]
+
+    Mdm::Service.where(name: name, port: port, proto: proto, host_id: mdm_host.id).first_or_create!(state: state, resource: resource, parents: [tcp_service])
+  end
 
   # This method wraps a block in a retry if we get a RecordNotUnique validation error.
   # This helps guard against race conditions.
